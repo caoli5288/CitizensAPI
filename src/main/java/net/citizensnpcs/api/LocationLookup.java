@@ -3,6 +3,7 @@ package net.citizensnpcs.api;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
@@ -34,10 +35,14 @@ import net.citizensnpcs.api.util.schedulers.SchedulerRunnable;
 public class LocationLookup extends SchedulerRunnable {
     private final Map<String, PerPlayerMetadata<?>> metadata = new java.util.concurrent.ConcurrentHashMap<>();
     private Future<Map<UUID, PhTreeF<NPC>>> npcFuture = null;
-    private Map<UUID, PhTreeF<NPC>> npcWorlds = new java.util.concurrent.ConcurrentHashMap<>();
+    private final Map<UUID, PhTreeF<NPC>> npcFuturePtPool = Maps.newConcurrentMap();
+    private final Map<UUID, PhTreeF<NPC>> npcWorlds = new java.util.concurrent.ConcurrentHashMap<>();
+    private final Map<UUID, PhTreeF<NPC>> npcWorldsPtPool = Maps.newHashMap();
     private Future<Map<UUID, PhTreeF<Player>>> playerFuture = null;
+    private final Map<UUID, PhTreeF<Player>> playerFuturePtPool = Maps.newConcurrentMap();
     private final NPCRegistry sourceRegistry;
-    private Map<UUID, PhTreeF<Player>> worlds = new java.util.concurrent.ConcurrentHashMap<>();
+    private final Map<UUID, PhTreeF<Player>> worlds = new java.util.concurrent.ConcurrentHashMap<>();
+    private final Map<UUID, PhTreeF<Player>> worldsPtPool = Maps.newHashMap();
 
     public LocationLookup() {
         this(CitizensAPI.getNPCRegistry());
@@ -124,7 +129,7 @@ public class LocationLookup extends SchedulerRunnable {
     @SuppressWarnings({ "unchecked", "rawtypes" })
     public void onJoin(PlayerJoinEvent event) {
         CitizensAPI.getScheduler().runEntityTask(event.getPlayer(), () -> {
-            updateWorld(event.getPlayer().getWorld());
+//            updateWorld(event.getPlayer().getWorld());
             for (PerPlayerMetadata meta : metadata.values()) {
                 if (meta.onJoin != null) {
                     meta.onJoin.accept(meta, event);
@@ -135,7 +140,7 @@ public class LocationLookup extends SchedulerRunnable {
 
     public void onQuit(PlayerQuitEvent event) {
         CitizensAPI.getScheduler().runEntityTask(event.getPlayer(), () -> {
-            updateWorld(event.getPlayer().getWorld());
+//            updateWorld(event.getPlayer().getWorld());
             for (PerPlayerMetadata<?> meta : metadata.values()) {
                 meta.sent.remove(event.getPlayer().getUniqueId());
             }
@@ -143,14 +148,23 @@ public class LocationLookup extends SchedulerRunnable {
     }
 
     public void onWorldUnload(WorldUnloadEvent event) {
-        PhTreeF<Player> cache = worlds.remove(event.getWorld().getUID());
+        UUID key = event.getWorld().getUID();
+        PhTreeF<Player> cache = worlds.remove(key);
         if (cache != null) {
             cache.clear();
         }
-        PhTreeF<NPC> npcCache = npcWorlds.remove(event.getWorld().getUID());
+        PhTreeF<NPC> npcCache = npcWorlds.remove(key);
         if (npcCache != null) {
             npcCache.clear();
         }
+        Optional.ofNullable(worldsPtPool.remove(key))
+                .ifPresent(PhTreeF::clear);
+        Optional.ofNullable(npcWorldsPtPool.remove(key))
+                .ifPresent(PhTreeF::clear);
+        Optional.ofNullable(playerFuturePtPool.remove(key))
+                .ifPresent(PhTreeF::clear);
+        Optional.ofNullable(npcFuturePtPool.remove(key))
+                .ifPresent(PhTreeF::clear);
     }
 
     @SuppressWarnings("unchecked")
@@ -162,32 +176,43 @@ public class LocationLookup extends SchedulerRunnable {
     @Override
     public void run() {
         if (npcFuture != null && npcFuture.isDone()) {
-            try {
-                npcWorlds = npcFuture.get();
-            } catch (InterruptedException | ExecutionException e) {
-                e.printStackTrace();
-            }
+            npcFuturePtPool.forEach((key, val) -> {
+                PhTreeF<NPC> old = npcWorlds.put(key, val);
+                if (old != null) {
+                    old.clear();
+                    npcWorldsPtPool.put(key, old);
+                }
+            });
+            npcFuturePtPool.clear();
             npcFuture = null;
         }
         if (npcFuture == null) {
-            Map<UUID, Collection<TreeFactory.Node<NPC>>> map = new java.util.concurrent.ConcurrentHashMap<>();
+            Map<UUID, Collection<TreeFactory.Node<NPC>>> map = Maps.newHashMap();
             Location loc = new Location(null, 0, 0, 0);
             for (NPC npc : sourceRegistry) {
                 if (npc.getEntity() == null)
                     continue;
                 npc.getEntity().getLocation(loc);
-                Collection<TreeFactory.Node<NPC>> nodes = map.computeIfAbsent(npc.getEntity().getWorld().getUID(),
-                        uid -> Lists.newArrayList());
-                nodes.add(new TreeFactory.Node<>(new double[] { loc.getX(), loc.getY(), loc.getZ() }, npc));
+                UUID key = npc.getEntity().getWorld().getUID();
+                Collection<TreeFactory.Node<NPC>> nodes = map.get(key);
+                if (nodes == null) {
+                    map.put(key, nodes = Lists.newArrayList());
+                    npcFuturePtPool.put(key, Optional.ofNullable(npcWorldsPtPool.remove(key))
+                            .orElseGet(() -> PhTreeF.create(3)));
+                }
+                nodes.add(new TreeFactory.Node<>(new double[]{loc.getX(), loc.getY(), loc.getZ()}, npc));
             }
-            npcFuture = ForkJoinPool.commonPool().submit(new TreeFactory<>(map));
+            npcFuture = ForkJoinPool.commonPool().submit(new TreeFactory<>(map, npcFuturePtPool));
         }
         if (playerFuture != null && playerFuture.isDone()) {
-            try {
-                worlds = playerFuture.get();
-            } catch (InterruptedException | ExecutionException e) {
-                e.printStackTrace();
-            }
+            playerFuturePtPool.forEach((key, val) -> {
+                PhTreeF<Player> old = worlds.put(key, val);
+                if (old != null) {
+                    old.clear();
+                    worldsPtPool.put(key, old);
+                }
+            });
+            playerFuturePtPool.clear();
             playerFuture = null;
         }
         if (playerFuture == null) {
@@ -197,15 +222,19 @@ public class LocationLookup extends SchedulerRunnable {
                 Collection<Player> players = Collections2.filter(world.getPlayers(), p -> !p.hasMetadata("NPC"));
                 if (players.isEmpty())
                     continue;
-                map.put(world.getUID(), Collections2.transform(players, p -> {
+                UUID key = world.getUID();
+                map.put(key, Collections2.transform(players, p -> {
                     p.getLocation(loc);
-                    return new TreeFactory.Node<>(new double[] { loc.getX(), loc.getY(), loc.getZ() }, p);
+                    return new TreeFactory.Node<>(new double[]{loc.getX(), loc.getY(), loc.getZ()}, p);
                 }));
+                playerFuturePtPool.put(key, Optional.ofNullable(worldsPtPool.remove(key))
+                        .orElseGet(() -> PhTreeF.create(3)));
             }
-            playerFuture = ForkJoinPool.commonPool().submit(new TreeFactory<>(map));
+            playerFuture = ForkJoinPool.commonPool().submit(new TreeFactory<>(map, playerFuturePtPool));
         }
     }
 
+    /*
     // TODO: remove?
     private void updateWorld(World world) {
         Collection<Player> players = Collections2.filter(world.getPlayers(), p -> !p.hasMetadata("NPC"));
@@ -258,6 +287,7 @@ public class LocationLookup extends SchedulerRunnable {
             }
         }
     }
+    */
 
     public static class PerPlayerMetadata<T> {
         private final BiConsumer<PerPlayerMetadata<T>, PlayerJoinEvent> onJoin;
@@ -294,22 +324,24 @@ public class LocationLookup extends SchedulerRunnable {
 
     private static final class TreeFactory<K, V> implements Callable<Map<K, PhTreeF<V>>> {
         private final Map<K, Collection<Node<V>>> source;
+        private final Map<K, PhTreeF<V>> ptPool;
 
-        public TreeFactory(Map<K, Collection<Node<V>>> source) {
+        public TreeFactory(Map<K, Collection<Node<V>>> source, Map<K, PhTreeF<V>> ptPool) {
             this.source = source;
+            this.ptPool = ptPool;
         }
 
         @Override
         public Map<K, PhTreeF<V>> call() throws Exception {
-            Map<K, PhTreeF<V>> result = Maps.newHashMap();
-            for (K k : source.keySet()) {
-                PhTreeF<V> tree = PhTreeF.create(3);
-                for (Node<V> entry : source.get(k)) {
-                    tree.put(entry.loc, entry.t);
+            source.forEach((k, list) -> {
+                PhTreeF<V> tree = ptPool.get(k);
+                if (tree != null) {
+                    for (Node<V> entry : list) {
+                        tree.put(entry.loc, entry.t);
+                    }
                 }
-                result.put(k, tree);
-            }
-            return result;
+            });
+            return ptPool;
         }
 
         public static class Node<T> {
