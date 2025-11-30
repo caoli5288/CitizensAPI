@@ -331,8 +331,9 @@ public class SpigotUtil {
     static {
         try {
             Class.forName("org.bukkit.Keyed");
+            Bukkit.class.getMethod("getRegistry", Class.class);
             SUPPORTS_KEYED = true;
-        } catch (ClassNotFoundException e) {
+        } catch (NoSuchMethodException | ClassNotFoundException e) {
         }
         try {
             Class.forName("io.papermc.paper.threadedregions.RegionizedServer");
